@@ -42,7 +42,7 @@ class Config:
     gin_lr_inference: float = 0.1
 
     # --- Training ---
-    epochs: int = 5
+    epochs: int = 3 # Reduced to prevent timeouts
     batch_size: int = 128
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
@@ -135,29 +135,10 @@ class ConvGIN(nn.Module):
         self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(32 * 7 * 7, 10))
 
     def forward(self, x):
-        h = x
-        for layer in self.layers:
-            h = layer.bu_weights(h)
-            if self.config.use_norm: h = layer.norm_bu(h)
-            h = layer.activation(h)
-        p_state_final = h
-        h = p_state_final
-        for i in range(len(self.layers) - 1, -1, -1):
-            layer = self.layers[i]
-            h = layer.td_weights(h)
-            if i > 0:
-                if self.config.use_norm: h = layer.norm_td(h)
-                h = layer.activation(h)
-        reconstruction = torch.sigmoid(h)
-        logits = self.classifier(p_state_final)
-        return reconstruction, logits
-
-    def predictive_completion(self, x, mask):
-        device = x.device
         p_states = [torch.zeros_like(x)]
         e_states = [torch.zeros_like(x)]
+        h = x
         with torch.no_grad():
-            h = x
             for i, layer in enumerate(self.layers):
                 h = layer.bu_weights(h)
                 if self.config.use_norm: h = layer.norm_bu(h)
@@ -170,24 +151,18 @@ class ConvGIN(nn.Module):
                 prediction = layer.td_weights(p_states[l+1])
                 if self.config.use_norm: prediction = layer.norm_td(prediction)
                 error = p_states[l] - layer.activation(prediction)
-                if l == 0: e_states[l] = (x - layer.activation(prediction)) * mask
-                else: e_states[l] = error
+                e_states[l] = error
             for l in range(len(self.layers)):
                 layer = self.layers[l]
                 bu_projection = layer.bu_weights(e_states[l])
                 if self.config.use_norm: bu_projection = layer.norm_bu(bu_projection)
-                delta_p = self.config.gin_lr_inference * (bu_projection - e_states[l+1])
-                p_states[l+1] = p_states[l+1] + delta_p
-        h = p_states[-1]
-        for i in range(len(self.layers) - 1, -1, -1):
-            layer = self.layers[i]
-            h = layer.td_weights(h)
-            if i > 0:
-                if self.config.use_norm: h = layer.norm_td(h)
-                h = layer.activation(h)
-        reconstruction = torch.sigmoid(h)
+                delta = self.config.gin_lr_inference * (bu_projection - e_states[l+1])
+                p_states[l+1] = p_states[l+1] + delta
+        final_prediction = self.layers[0].td_weights(p_states[1])
+        if self.config.use_norm: final_prediction = self.layers[0].norm_td(final_prediction)
+        reconstruction = torch.sigmoid(final_prediction)
         logits = self.classifier(p_states[-1])
-        return reconstruction, logits
+        return reconstruction, logits, e_states
 
 def run_experiment(config: Config):
     print(f"\n{'='*40}\n🚀 Starting Experiment: {config.experiment_name}\n{'='*40}")
@@ -209,16 +184,26 @@ def run_experiment(config: Config):
         for occluded_img, original_img, labels in train_loader:
             occluded_img, original_img, labels = occluded_img.to(device), original_img.to(device), labels.to(device)
             optimizer.zero_grad()
-            recon, logits = model(occluded_img)
-            loss = recon_criterion(recon, original_img) + class_criterion(logits, labels)
+            if config.model_type == 'gin':
+                recon, logits, e_states = model(occluded_img)
+                loss_recon = sum(torch.mean(e**2) for e in e_states)
+            else: # Autoencoder
+                recon, logits = model(occluded_img)
+                loss_recon = recon_criterion(recon, original_img)
+            loss = loss_recon + class_criterion(logits, labels)
             loss.backward(); optimizer.step()
         model.eval()
         total_val_loss = 0; accuracy_metric.reset()
         with torch.no_grad():
             for occluded_img, original_img, labels in val_loader:
                 occluded_img, original_img, labels = occluded_img.to(device), original_img.to(device), labels.to(device)
-                recon, logits = model(occluded_img)
-                loss = recon_criterion(recon, original_img) + class_criterion(logits, labels)
+                if config.model_type == 'gin':
+                    recon, logits, e_states = model(occluded_img)
+                    loss_recon = sum(torch.mean(e**2) for e in e_states)
+                else: # Autoencoder
+                    recon, logits = model(occluded_img)
+                    loss_recon = recon_criterion(recon, original_img)
+                loss = loss_recon + class_criterion(logits, labels)
                 total_val_loss += loss.item(); accuracy_metric.update(logits, labels)
         avg_val_loss = total_val_loss / len(val_loader)
         val_acc = accuracy_metric.compute().item()
@@ -234,111 +219,34 @@ def run_experiment(config: Config):
     with torch.no_grad():
         for occluded_img, original_img, labels in test_loader:
             occluded_img, original_img, labels = occluded_img.to(device), original_img.to(device), labels.to(device)
-            recon, logits = model(occluded_img)
+            if config.model_type == 'gin':
+                recon, logits, _ = model(occluded_img)
+            else:
+                recon, logits = model(occluded_img)
             test_mse += recon_criterion(recon, original_img).item()
             test_ssim += piq.ssim(recon, original_img, data_range=1.).item()
             accuracy_metric.update(logits, labels)
     final_mse = test_mse / len(test_loader); final_ssim = test_ssim / len(test_loader)
     final_acc = accuracy_metric.compute().item()
-    print(f"Final Test Metrics (standard forward pass):\n  - MSE: {final_mse:.6f}\n  - SSIM: {final_ssim:.4f}\n  - Accuracy: {final_acc:.4f}")
-    results = {"mse": final_mse, "ssim": final_ssim, "accuracy": final_acc}
-    if config.model_type == 'gin':
-        print("\n--- Evaluating GIN's Predictive Completion method ---")
-        test_mse_pc, test_ssim_pc = 0, 0; accuracy_metric.reset()
-        with torch.no_grad():
-            for occluded_img, original_img, labels in test_loader:
-                occluded_img, original_img, labels = occluded_img.to(device), original_img.to(device), labels.to(device)
-                mask = (occluded_img > 0).float()
-                recon, logits = model.predictive_completion(occluded_img, mask)
-                test_mse_pc += recon_criterion(recon, original_img).item()
-                test_ssim_pc += piq.ssim(recon, original_img, data_range=1.).item()
-                accuracy_metric.update(logits, labels)
-        final_mse_pc = test_mse_pc / len(test_loader); final_ssim_pc = test_ssim_pc / len(test_loader)
-        final_acc_pc = accuracy_metric.compute().item()
-        print(f"Predictive Completion Metrics:\n  - MSE: {final_mse_pc:.6f}\n  - SSIM: {final_ssim_pc:.4f}\n  - Accuracy: {final_acc_pc:.4f}")
-        results["mse_predictive"] = final_mse_pc; results["ssim_predictive"] = final_ssim_pc; results["acc_predictive"] = final_acc_pc
-    print("\n--- Generating Visualizations ---")
-    occluded_vis, original_vis, _ = next(iter(test_loader))
-    occluded_vis = occluded_vis[:config.num_vis_samples].to(device)
-    original_vis = original_vis[:config.num_vis_samples].to(device)
-    model.eval()
-    with torch.no_grad(): recon_vis, _ = model(occluded_vis)
-    fig, axes = plt.subplots(3, config.num_vis_samples, figsize=(config.num_vis_samples * 1.5, 5))
-    for i in range(config.num_vis_samples):
-        axes[0, i].imshow(original_vis[i].cpu().squeeze(), cmap='gray'); axes[0, i].set_title("Original"); axes[0, i].axis('off')
-        axes[1, i].imshow(occluded_vis[i].cpu().squeeze(), cmap='gray'); axes[1, i].set_title("Occluded"); axes[1, i].axis('off')
-        axes[2, i].imshow(recon_vis[i].cpu().squeeze(), cmap='gray'); axes[2, i].set_title("Recon"); axes[2, i].axis('off')
-    fig.suptitle(f"Reconstructions for {config.experiment_name}", fontsize=16)
-    plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.savefig(f"results/{config.experiment_name}/reconstructions.png")
-    print(f"Saved reconstruction visualization to results/{config.experiment_name}/reconstructions.png")
-    end_time = time.time()
-    print(f"\nExperiment finished in {end_time - start_time:.2f} seconds.")
-    return results
+    print(f"Final Test Metrics:\n  - MSE: {final_mse:.6f}\n  - SSIM: {final_ssim:.4f}\n  - Accuracy: {final_acc:.4f}")
+    return {"mse": final_mse, "ssim": final_ssim, "accuracy": final_acc}
 
 if __name__ == '__main__':
     final_configs = [
-        Config(model_type='autoencoder', experiment_name='conv_autoencoder', epochs=5),
-        Config(model_type='gin', experiment_name='conv_gin', epochs=5),
+        Config(model_type='autoencoder', experiment_name='final_conv_autoencoder', epochs=3),
+        Config(model_type='gin', experiment_name='final_true_gin', epochs=3),
     ]
     all_results = {}
     for config in final_configs:
         results = run_experiment(config)
         all_results[config.experiment_name] = results
     print("\n\n" + "="*80)
-    print("🔬 Final Convolutional Ablation Study Results 🔬".center(80))
+    print("🔬 Final True GIN vs. Autoencoder Results 🔬".center(80))
     print("="*80)
-    header = f"{'Experiment':<25} | {'MSE (Train)':<12} | {'MSE (Predict)':<12} | {'SSIM':<10} | {'Accuracy':<10}"
+    header = f"{'Experiment':<30} | {'MSE':<10} | {'SSIM':<10} | {'Accuracy':<10}"
     print(header)
-    print("-" * len(header))
+    print("-" * (len(header)))
     for name, metrics in all_results.items():
-        mse_pred = metrics.get('mse_predictive', float('nan'))
-        ssim_pred = metrics.get('ssim_predictive', float('nan'))
-        acc_pred = metrics.get('acc_predictive', float('nan'))
-        print(f"{name:<25} | {metrics['mse']:<12.6f} | {mse_pred:<12.6f} | {metrics['ssim']:<10.4f} | {metrics['accuracy']:<10.4f}")
+        print(f"{name:<30} | {metrics['mse']:<10.6f} | {metrics['ssim']:<10.4f} | {metrics['accuracy']:<10.4f}")
     print("="*80)
-    print("\n--- Generating Combined Final Visualization ---")
-    try:
-        test_loader = get_dataloaders(Config())[2]
-        occluded_vis, original_vis, _ = next(iter(test_loader))
-        occluded_vis = occluded_vis[:final_configs[0].num_vis_samples].to(torch.device(final_configs[0].device))
-        original_vis = original_vis[:final_configs[0].num_vis_samples].to(torch.device(final_configs[0].device))
-        fig, axes = plt.subplots(4, final_configs[0].num_vis_samples, figsize=(final_configs[0].num_vis_samples * 1.5, 8))
-        for i in range(final_configs[0].num_vis_samples):
-            axes[0, i].imshow(original_vis[i].cpu().squeeze(), cmap='gray'); axes[0, i].axis('off')
-            if i == 0: axes[0, i].set_title("Original", rotation=90, x=-0.2, y=0, va='center', ha='right')
-            axes[1, i].imshow(occluded_vis[i].cpu().squeeze(), cmap='gray'); axes[1, i].axis('off')
-            if i == 0: axes[1, i].set_title("Occluded", rotation=90, x=-0.2, y=0, va='center', ha='right')
-
-        for model_idx, config in enumerate(final_configs):
-            model_path = f"results/{config.experiment_name}/best_model.pth"
-            if not os.path.exists(model_path):
-                print(f"Warning: Model file not found at {model_path}.")
-                continue
-            if config.model_type == 'gin': model = ConvGIN(config)
-            else: model = ConvAutoencoder()
-            model.load_state_dict(torch.load(model_path, map_location=config.device)); model.to(config.device); model.eval()
-            with torch.no_grad():
-                recon_vis, _ = model(occluded_vis)
-                if config.model_type == 'gin':
-                    mask = (occluded_vis > 0).float()
-                    recon_pc, _ = model.predictive_completion(occluded_vis, mask)
-
-            for i in range(final_configs[0].num_vis_samples):
-                ax = axes[model_idx + 2, i]
-                recon_to_show = recon_vis if model_idx == 0 else recon_pc if config.model_type == 'gin' else recon_vis
-                ax.imshow(recon_to_show[i].cpu().squeeze(), cmap='gray'); ax.axis('off')
-                title = f"{config.experiment_name}"
-                if config.model_type == 'gin' and model_idx == 1: title += " (Predictive)"
-                if i == 0: ax.set_title(title, rotation=90, x=-0.2, y=0, va='center', ha='right')
-                if model_idx == 1 and config.model_type == 'gin' :
-                     axes[2, i].imshow(recon_vis[i].cpu().squeeze(), cmap='gray'); axes[2, i].axis('off')
-                     if i==0: axes[2,i].set_title("conv_gin (Standard)", rotation=90, x=-0.2, y=0, va='center', ha='right')
-
-
-        fig.suptitle("Final Side-by-Side Model Reconstructions", fontsize=16)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig("final_conv_ablation_summary.png")
-        print("Saved combined visualization to final_conv_ablation_summary.png")
-    except Exception as e:
-        print(f"\nCould not generate final visualization due to an error: {e}")
     print("\n--- Script Finished ---")
