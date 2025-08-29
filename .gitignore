@@ -1,0 +1,12 @@
+# Ignore python cache
+__pycache__/
+*.pyc
+
+# Ignore data files
+data/
+
+# Ignore generated images and other artifacts
+*.png
+*.jpg
+*.jpeg
+results/
